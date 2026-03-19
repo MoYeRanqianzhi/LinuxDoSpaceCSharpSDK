@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
+using System.Net.Http.Headers;
 
 namespace LinuxDoSpace;
 
@@ -142,10 +143,11 @@ public sealed class Client : IAsyncDisposable
     private readonly TimeSpan _connectTimeout;
     private readonly TimeSpan _streamTimeout;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Channel<object> _fullQueue = Channel.CreateUnbounded<object>();
     private readonly object _lock = new();
     private readonly Dictionary<string, List<Binding>> _bindings = new(StringComparer.Ordinal);
+    private readonly List<Channel<object>> _fullListeners = [];
     private readonly TaskCompletionSource<bool> _firstConnect = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Stream? _activeStream;
     private Task _readerTask;
     private bool _closed;
 
@@ -167,14 +169,41 @@ public sealed class Client : IAsyncDisposable
 
     public async IAsyncEnumerable<MailMessage> ListenAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        while (await _fullQueue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+        if (_closed) yield break;
+
+        var queue = Channel.CreateUnbounded<object>();
+        lock (_lock)
         {
-            while (_fullQueue.Reader.TryRead(out var item))
+            if (_closed)
             {
-                if (ReferenceEquals(item, CloseSignal)) yield break;
-                if (item is LinuxDoSpaceException ex) throw ex;
-                if (item is MailMessage message) yield return message;
+                yield break;
             }
+            if (_firstConnect.Task.IsFaulted)
+            {
+                throw _firstConnect.Task.Exception?.InnerException ?? new StreamException("initial stream connection failed");
+            }
+            _fullListeners.Add(queue);
+        }
+
+        try
+        {
+            while (await queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                while (queue.Reader.TryRead(out var item))
+                {
+                    if (ReferenceEquals(item, CloseSignal)) yield break;
+                    if (item is LinuxDoSpaceException ex) throw ex;
+                    if (item is MailMessage message) yield return message;
+                }
+            }
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                _fullListeners.Remove(queue);
+            }
+            queue.Writer.TryWrite(CloseSignal);
         }
     }
 
@@ -222,7 +251,8 @@ public sealed class Client : IAsyncDisposable
         if (_closed) return;
         _closed = true;
         _cts.Cancel();
-        _fullQueue.Writer.TryWrite(CloseSignal);
+        CloseActiveStream();
+        BroadcastControl(CloseSignal);
         List<MailBox> mailboxes;
         lock (_lock)
         {
@@ -241,7 +271,7 @@ public sealed class Client : IAsyncDisposable
             try
             {
                 await ConsumeOnceAsync(_cts.Token).ConfigureAwait(false);
-                if (first) { first = false; _firstConnect.TrySetResult(true); }
+                first = false;
             }
             catch (AuthenticationException ex)
             {
@@ -262,7 +292,7 @@ public sealed class Client : IAsyncDisposable
     private async Task ConsumeOnceAsync(CancellationToken cancellationToken)
     {
         using var req = new HttpRequestMessage(HttpMethod.Get, new Uri(_baseUri, "/v1/token/email/stream"));
-        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
         req.Headers.Accept.ParseAdd("application/x-ndjson");
         using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connectCts.CancelAfter(_connectTimeout);
@@ -270,6 +300,11 @@ public sealed class Client : IAsyncDisposable
         if ((int)resp.StatusCode is 401 or 403) throw new AuthenticationException("api token was rejected by backend");
         if (!resp.IsSuccessStatusCode) throw new StreamException($"unexpected stream status code: {(int)resp.StatusCode}");
         using var stream = await resp.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        lock (_lock)
+        {
+            _activeStream = stream;
+        }
+        MarkInitialReady();
         using var reader = new StreamReader(stream, Encoding.UTF8, true, 8192, true);
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -281,6 +316,13 @@ public sealed class Client : IAsyncDisposable
             var trimmed = line.Trim();
             if (trimmed.Length == 0) continue;
             HandleLine(trimmed);
+        }
+        lock (_lock)
+        {
+            if (ReferenceEquals(_activeStream, stream))
+            {
+                _activeStream = null;
+            }
         }
     }
 
@@ -310,7 +352,7 @@ public sealed class Client : IAsyncDisposable
         var sender = payload.TryGetProperty("original_envelope_from", out var s) ? (s.GetString() ?? string.Empty).Trim() : string.Empty;
 
         var primary = recipients.FirstOrDefault() ?? string.Empty;
-        _fullQueue.Writer.TryWrite(BuildMessage(primary, sender, recipients, receivedAt, raw, rawBytes, headers, body));
+        BroadcastFull(BuildMessage(primary, sender, recipients, receivedAt, raw, rawBytes, headers, body));
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var recipient in recipients.Where(seen.Add))
         {
@@ -340,10 +382,60 @@ public sealed class Client : IAsyncDisposable
 
     private void BroadcastControl(LinuxDoSpaceException error)
     {
-        _fullQueue.Writer.TryWrite(error);
+        BroadcastControl((object)error);
         List<MailBox> boxes;
         lock (_lock) boxes = _bindings.Values.SelectMany(v => v.Select(b => b.MailBox)).Distinct().ToList();
         foreach (var box in boxes) box.EnqueueControl(error);
+    }
+
+    private void BroadcastFull(MailMessage message)
+    {
+        List<Channel<object>> listeners;
+        lock (_lock)
+        {
+            listeners = [.. _fullListeners];
+        }
+        foreach (var listener in listeners)
+        {
+            listener.Writer.TryWrite(message);
+        }
+    }
+
+    private void BroadcastControl(object item)
+    {
+        List<Channel<object>> listeners;
+        lock (_lock)
+        {
+            listeners = [.. _fullListeners];
+            if (ReferenceEquals(item, CloseSignal))
+            {
+                _fullListeners.Clear();
+            }
+        }
+        foreach (var listener in listeners)
+        {
+            listener.Writer.TryWrite(item);
+        }
+    }
+
+    private void MarkInitialReady()
+    {
+        if (_firstConnect.Task.IsCompleted)
+        {
+            return;
+        }
+        _firstConnect.TrySetResult(true);
+    }
+
+    private void CloseActiveStream()
+    {
+        Stream? stream;
+        lock (_lock)
+        {
+            stream = _activeStream;
+            _activeStream = null;
+        }
+        stream?.Dispose();
     }
 
     private static MailMessage BuildMessage(string address, string sender, IReadOnlyList<string> recipients, DateTimeOffset receivedAt, string raw, byte[] rawBytes, Dictionary<string, string> headers, string body)
