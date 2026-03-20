@@ -98,6 +98,7 @@ public sealed class MailBox : IAsyncDisposable
         }
         finally
         {
+            _listenActivated = false;
             Interlocked.Exchange(ref _listenState, 0);
         }
     }
@@ -150,6 +151,7 @@ public sealed class Client : IAsyncDisposable
     private Stream? _activeStream;
     private Task _readerTask;
     private bool _closed;
+    private LinuxDoSpaceException? _fatalError;
 
     public Client(string token, string baseUrl = "https://api.linuxdo.space", TimeSpan? connectTimeout = null, TimeSpan? streamTimeout = null)
     {
@@ -169,19 +171,12 @@ public sealed class Client : IAsyncDisposable
 
     public async IAsyncEnumerable<MailMessage> ListenAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        if (_closed) yield break;
+        AssertUsable();
 
         var queue = Channel.CreateUnbounded<object>();
         lock (_lock)
         {
-            if (_closed)
-            {
-                yield break;
-            }
-            if (_firstConnect.Task.IsFaulted)
-            {
-                throw _firstConnect.Task.Exception?.InnerException ?? new StreamException("initial stream connection failed");
-            }
+            AssertUsable();
             _fullListeners.Add(queue);
         }
 
@@ -209,6 +204,7 @@ public sealed class Client : IAsyncDisposable
 
     public MailBox Bind(string? prefix = null, string? pattern = null, string suffix = Suffix.LinuxDoSpace, bool allowOverlap = false)
     {
+        AssertUsable();
         var hasPrefix = !string.IsNullOrWhiteSpace(prefix);
         var hasPattern = !string.IsNullOrWhiteSpace(pattern);
         if (hasPrefix == hasPattern) throw new ArgumentException("exactly one of prefix or pattern must be provided");
@@ -242,7 +238,11 @@ public sealed class Client : IAsyncDisposable
         return mailbox;
     }
 
-    public IReadOnlyList<MailBox> Route(MailMessage message) => MatchForAddress(message.Address).Select(v => v.MailBox).ToArray();
+    public IReadOnlyList<MailBox> Route(MailMessage message)
+    {
+        AssertUsable();
+        return MatchForAddress(message.Address).Select(v => v.MailBox).ToArray();
+    }
 
     public ValueTask DisposeAsync() => CloseAsync();
 
@@ -276,7 +276,7 @@ public sealed class Client : IAsyncDisposable
             catch (AuthenticationException ex)
             {
                 if (first) _firstConnect.TrySetException(ex);
-                BroadcastControl(ex);
+                FailAll(ex);
                 return;
             }
             catch (Exception ex)
@@ -436,6 +436,31 @@ public sealed class Client : IAsyncDisposable
             _activeStream = null;
         }
         stream?.Dispose();
+    }
+
+    private void FailAll(LinuxDoSpaceException error)
+    {
+        _fatalError = error;
+        _closed = true;
+        _cts.Cancel();
+        CloseActiveStream();
+        BroadcastControl(error);
+    }
+
+    private void AssertUsable()
+    {
+        if (_fatalError is not null)
+        {
+            throw _fatalError;
+        }
+        if (_closed)
+        {
+            throw new LinuxDoSpaceException("client is already closed");
+        }
+        if (_firstConnect.Task.IsFaulted)
+        {
+            throw _firstConnect.Task.Exception?.InnerException ?? new StreamException("initial stream connection failed");
+        }
     }
 
     private static MailMessage BuildMessage(string address, string sender, IReadOnlyList<string> recipients, DateTimeOffset receivedAt, string raw, byte[] rawBytes, Dictionary<string, string> headers, string body)
