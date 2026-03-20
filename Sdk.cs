@@ -10,6 +10,9 @@ namespace LinuxDoSpace;
 
 public static class Suffix
 {
+    // LinuxDoSpace is semantic rather than literal: SDK bindings resolve it to
+    // "<owner_username>.linuxdo.space" after the stream ready event provides
+    // owner_username.
     public const string LinuxDoSpace = "linuxdo.space";
 }
 
@@ -152,6 +155,7 @@ public sealed class Client : IAsyncDisposable
     private Task _readerTask;
     private bool _closed;
     private LinuxDoSpaceException? _fatalError;
+    private string? _ownerUsername;
 
     public Client(string token, string baseUrl = "https://api.linuxdo.space", TimeSpan? connectTimeout = null, TimeSpan? streamTimeout = null)
     {
@@ -208,7 +212,7 @@ public sealed class Client : IAsyncDisposable
         var hasPrefix = !string.IsNullOrWhiteSpace(prefix);
         var hasPattern = !string.IsNullOrWhiteSpace(pattern);
         if (hasPrefix == hasPattern) throw new ArgumentException("exactly one of prefix or pattern must be provided");
-        var normalizedSuffix = suffix.Trim().ToLowerInvariant();
+        var normalizedSuffix = ResolveBindingSuffix(suffix);
         var normalizedPrefix = hasPrefix ? prefix!.Trim().ToLowerInvariant() : null;
         var mode = hasPrefix ? "exact" : "pattern";
         var regex = hasPattern ? new Regex($"^(?:{pattern})$", RegexOptions.CultureInvariant | RegexOptions.Compiled) : null;
@@ -304,7 +308,6 @@ public sealed class Client : IAsyncDisposable
         {
             _activeStream = stream;
         }
-        MarkInitialReady();
         using var reader = new StreamReader(stream, Encoding.UTF8, true, 8192, true);
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -312,7 +315,14 @@ public sealed class Client : IAsyncDisposable
             var done = await Task.WhenAny(readTask, Task.Delay(_streamTimeout, cancellationToken)).ConfigureAwait(false);
             if (done != readTask) throw new StreamException("mail stream stalled and will reconnect");
             var line = await readTask.ConfigureAwait(false);
-            if (line is null) return;
+            if (line is null)
+            {
+                if (!_closed && !_firstConnect.Task.IsCompleted)
+                {
+                    throw new StreamException("mail stream ended before ready event");
+                }
+                return;
+            }
             var trimmed = line.Trim();
             if (trimmed.Length == 0) continue;
             HandleLine(trimmed);
@@ -331,7 +341,12 @@ public sealed class Client : IAsyncDisposable
         using var doc = JsonDocument.Parse(line);
         if (!doc.RootElement.TryGetProperty("type", out var typeNode)) throw new StreamException("event missing type");
         var type = typeNode.GetString() ?? string.Empty;
-        if (type is "ready" or "heartbeat") return;
+        if (type == "ready")
+        {
+            HandleReady(doc.RootElement);
+            return;
+        }
+        if (type == "heartbeat") return;
         if (type != "mail") return;
         DispatchMail(doc.RootElement);
     }
@@ -425,6 +440,43 @@ public sealed class Client : IAsyncDisposable
             return;
         }
         _firstConnect.TrySetResult(true);
+    }
+
+    private void HandleReady(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("owner_username", out var ownerNode))
+        {
+            throw new StreamException("ready event did not include owner_username");
+        }
+
+        var normalizedOwnerUsername = (ownerNode.GetString() ?? string.Empty).Trim().ToLowerInvariant();
+        if (normalizedOwnerUsername.Length == 0)
+        {
+            throw new StreamException("ready event did not include owner_username");
+        }
+
+        _ownerUsername = normalizedOwnerUsername;
+        MarkInitialReady();
+    }
+
+    private string ResolveBindingSuffix(string suffix)
+    {
+        var normalizedSuffix = suffix.Trim().ToLowerInvariant();
+        if (normalizedSuffix.Length == 0)
+        {
+            throw new ArgumentException("suffix must not be empty");
+        }
+        if (!string.Equals(normalizedSuffix, Suffix.LinuxDoSpace, StringComparison.Ordinal))
+        {
+            return normalizedSuffix;
+        }
+
+        var ownerUsername = (_ownerUsername ?? string.Empty).Trim().ToLowerInvariant();
+        if (ownerUsername.Length == 0)
+        {
+            throw new StreamException("stream bootstrap did not provide owner_username required to resolve Suffix.LinuxDoSpace");
+        }
+        return $"{ownerUsername}.{normalizedSuffix}";
     }
 
     private void CloseActiveStream()

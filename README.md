@@ -14,6 +14,11 @@ This directory contains a C# SDK implementation for LinuxDoSpace mail stream pro
   - `allowOverlap=false` stops matching
   - `allowOverlap=true` continues matching
 
+Important:
+
+- `Suffix.LinuxDoSpace` is semantic, not literal
+- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
+
 ## Local Verification Status
 
 Current environment does not have .NET SDK installed, so this SDK was not compiled locally in this session.
