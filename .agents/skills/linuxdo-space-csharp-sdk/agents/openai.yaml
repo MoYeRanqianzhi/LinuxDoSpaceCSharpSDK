@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinuxDoSpace C# SDK"
+  short_description: "Use or maintain the LinuxDoSpace C# SDK"
+  default_prompt: "Use $linuxdo-space-csharp-sdk when writing consumer code against sdk/csharp or when updating the LinuxDoSpace C# SDK with matching docs and validation guidance."
