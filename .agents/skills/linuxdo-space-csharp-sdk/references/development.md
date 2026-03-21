@@ -34,4 +34,3 @@ dotnet pack -c Release -o release-artifacts
 - `../../../README.md`
 - `../../../.github/workflows/ci.yml`
 - `../../../.github/workflows/release.yml`
-

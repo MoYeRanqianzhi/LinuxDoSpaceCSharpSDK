@@ -31,4 +31,3 @@ Read [references/development.md](references/development.md) only when editing `s
 - Do not describe this SDK as already published on a public NuGet feed.
 - Do not replace cancellation-token consumption with imaginary timeout APIs.
 - Do not add hidden pre-listen mailbox buffering.
-

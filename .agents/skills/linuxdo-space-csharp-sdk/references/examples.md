@@ -21,4 +21,3 @@ await using var mailbox = client.Bind(
 ```csharp
 var matches = client.Route(message);
 ```
-

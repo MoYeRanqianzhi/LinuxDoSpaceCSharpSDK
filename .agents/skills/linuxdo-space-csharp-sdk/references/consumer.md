@@ -43,4 +43,3 @@ await foreach (var item in mailbox.ListenAsync(ct))
 - `Route(message)` is read-only local matching only.
 - Full-stream messages use the first recipient projection address.
 - Mailbox messages use matched-recipient projection addresses.
-

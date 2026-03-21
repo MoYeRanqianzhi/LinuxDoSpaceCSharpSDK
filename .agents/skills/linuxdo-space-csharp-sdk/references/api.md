@@ -29,4 +29,3 @@
 - Regex bindings are full-match regexes.
 - `Suffix.LinuxDoSpace` is semantic, not literal.
 - Mailbox queues activate only while mailbox listen is active.
-
