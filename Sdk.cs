@@ -1,19 +1,84 @@
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 
 namespace LinuxDoSpace;
 
 public static class Suffix
 {
     // LinuxDoSpace is semantic rather than literal: SDK bindings resolve it to
-    // "<owner_username>.linuxdo.space" after the stream ready event provides
-    // owner_username.
+    // the current token owner's canonical `@<owner>-mail.linuxdo.space`
+    // namespace after the stream ready event exposes owner_username.
     public const string LinuxDoSpace = "linuxdo.space";
+
+    public static SemanticSuffix WithSuffix(string fragment) => new(LinuxDoSpace, fragment);
+}
+
+public sealed class SemanticSuffix
+{
+    public SemanticSuffix(string baseSuffix, string fragment)
+    {
+        Base = (baseSuffix ?? string.Empty).Trim().ToLowerInvariant();
+        if (Base.Length == 0)
+        {
+            throw new ArgumentException("base suffix must not be empty");
+        }
+        MailSuffixFragment = NormalizeMailSuffixFragment(fragment);
+    }
+
+    public string Base { get; }
+
+    public string MailSuffixFragment { get; }
+
+    public SemanticSuffix WithSuffix(string fragment) => new(Base, fragment);
+
+    private static string NormalizeMailSuffixFragment(string raw)
+    {
+        var value = (raw ?? string.Empty).Trim().ToLowerInvariant();
+        if (value.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder(value.Length);
+        var lastWasDash = false;
+        foreach (var character in value)
+        {
+            if ((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9'))
+            {
+                builder.Append(character);
+                lastWasDash = false;
+                continue;
+            }
+
+            if (!lastWasDash)
+            {
+                builder.Append('-');
+                lastWasDash = true;
+            }
+        }
+
+        var normalized = builder.ToString().Trim('-');
+        if (normalized.Length == 0)
+        {
+            throw new ArgumentException("mail suffix fragment does not contain any valid dns characters");
+        }
+        if (normalized.Contains('.', StringComparison.Ordinal))
+        {
+            throw new ArgumentException("mail suffix fragment must stay inside one dns label");
+        }
+        if (normalized.Length > 48)
+        {
+            throw new ArgumentException("mail suffix fragment must be 48 characters or fewer");
+        }
+        return normalized;
+    }
 }
 
 public class LinuxDoSpaceException : Exception
@@ -156,6 +221,7 @@ public sealed class Client : IAsyncDisposable
     private bool _closed;
     private LinuxDoSpaceException? _fatalError;
     private string? _ownerUsername;
+    private string[]? _syncedMailboxSuffixFragments;
 
     public Client(string token, string baseUrl = "https://api.linuxdo.space", TimeSpan? connectTimeout = null, TimeSpan? streamTimeout = null)
     {
@@ -208,11 +274,21 @@ public sealed class Client : IAsyncDisposable
 
     public MailBox Bind(string? prefix = null, string? pattern = null, string suffix = Suffix.LinuxDoSpace, bool allowOverlap = false)
     {
+        return Bind(prefix, pattern, ResolveBindingSuffixInput(suffix), allowOverlap);
+    }
+
+    public MailBox Bind(string? prefix = null, string? pattern = null, SemanticSuffix? suffix = null, bool allowOverlap = false)
+    {
+        return Bind(prefix, pattern, ResolveBindingSuffixInput(suffix ?? new SemanticSuffix(Suffix.LinuxDoSpace, string.Empty)), allowOverlap);
+    }
+
+    private MailBox Bind(string? prefix, string? pattern, (string ResolvedSuffix, string? MailSuffixFragment) resolvedSuffix, bool allowOverlap)
+    {
         AssertUsable();
         var hasPrefix = !string.IsNullOrWhiteSpace(prefix);
         var hasPattern = !string.IsNullOrWhiteSpace(pattern);
         if (hasPrefix == hasPattern) throw new ArgumentException("exactly one of prefix or pattern must be provided");
-        var normalizedSuffix = ResolveBindingSuffix(suffix);
+        var normalizedSuffix = resolvedSuffix.ResolvedSuffix;
         var normalizedPrefix = hasPrefix ? prefix!.Trim().ToLowerInvariant() : null;
         var mode = hasPrefix ? "exact" : "pattern";
         var regex = hasPattern ? new Regex($"^(?:{pattern})$", RegexOptions.CultureInvariant | RegexOptions.Compiled) : null;
@@ -227,6 +303,7 @@ public sealed class Client : IAsyncDisposable
                 list.RemoveAll(v => ReferenceEquals(v, bindingRef));
                 if (list.Count == 0) _bindings.Remove(normalizedSuffix);
             }
+            _ = TrySyncRemoteMailboxFilters(strict: false);
         });
         bindingRef = new Binding { Mode = mode, Suffix = normalizedSuffix, AllowOverlap = allowOverlap, Prefix = normalizedPrefix, Regex = regex, MailBox = mailbox };
 
@@ -238,6 +315,15 @@ public sealed class Client : IAsyncDisposable
                 _bindings[normalizedSuffix] = list;
             }
             list.Add(bindingRef);
+        }
+        try
+        {
+            TrySyncRemoteMailboxFilters(strict: true);
+        }
+        catch
+        {
+            mailbox.CloseAsync().GetAwaiter().GetResult();
+            throw;
         }
         return mailbox;
     }
@@ -384,7 +470,23 @@ public sealed class Client : IAsyncDisposable
         var localPart = chunks[0];
         var suffix = chunks[1];
         List<Binding> chain;
-        lock (_lock) chain = _bindings.TryGetValue(suffix, out var list) ? [.. list] : [];
+        lock (_lock)
+        {
+            chain = _bindings.TryGetValue(suffix, out var list) ? [.. list] : [];
+            if (chain.Count == 0)
+            {
+                var ownerUsername = (_ownerUsername ?? string.Empty).Trim().ToLowerInvariant();
+                if (ownerUsername.Length > 0)
+                {
+                var semanticDefaultSuffix = $"{ownerUsername}.{Suffix.LinuxDoSpace}";
+                var semanticMailSuffix = $"{ownerUsername}-mail.{Suffix.LinuxDoSpace}";
+                if (suffix == semanticDefaultSuffix)
+                {
+                    chain = _bindings.TryGetValue(semanticMailSuffix, out var semanticList) ? [.. semanticList] : [];
+                }
+            }
+        }
+        }
         var matched = new List<Binding>();
         foreach (var binding in chain)
         {
@@ -456,10 +558,11 @@ public sealed class Client : IAsyncDisposable
         }
 
         _ownerUsername = normalizedOwnerUsername;
+        TrySyncRemoteMailboxFilters(strict: true);
         MarkInitialReady();
     }
 
-    private string ResolveBindingSuffix(string suffix)
+    private (string ResolvedSuffix, string? MailSuffixFragment) ResolveBindingSuffixInput(string suffix)
     {
         var normalizedSuffix = suffix.Trim().ToLowerInvariant();
         if (normalizedSuffix.Length == 0)
@@ -468,7 +571,7 @@ public sealed class Client : IAsyncDisposable
         }
         if (!string.Equals(normalizedSuffix, Suffix.LinuxDoSpace, StringComparison.Ordinal))
         {
-            return normalizedSuffix;
+            return (normalizedSuffix, null);
         }
 
         var ownerUsername = (_ownerUsername ?? string.Empty).Trim().ToLowerInvariant();
@@ -476,7 +579,88 @@ public sealed class Client : IAsyncDisposable
         {
             throw new StreamException("stream bootstrap did not provide owner_username required to resolve Suffix.LinuxDoSpace");
         }
-        return $"{ownerUsername}.{normalizedSuffix}";
+        return ($"{ownerUsername}-mail.{normalizedSuffix}", string.Empty);
+    }
+
+    private (string ResolvedSuffix, string? MailSuffixFragment) ResolveBindingSuffixInput(SemanticSuffix suffix)
+    {
+        if (!string.Equals(suffix.Base, Suffix.LinuxDoSpace, StringComparison.Ordinal))
+        {
+            return (suffix.Base, null);
+        }
+
+        var ownerUsername = (_ownerUsername ?? string.Empty).Trim().ToLowerInvariant();
+        if (ownerUsername.Length == 0)
+        {
+            var message = suffix.MailSuffixFragment.Length == 0
+                ? "stream bootstrap did not provide owner_username required to resolve Suffix.LinuxDoSpace"
+                : "stream bootstrap did not provide owner_username required to resolve Suffix.WithSuffix(...)";
+            throw new StreamException(message);
+        }
+        return ($"{ownerUsername}-mail{suffix.MailSuffixFragment}.{suffix.Base}", suffix.MailSuffixFragment);
+    }
+
+    private void TrySyncRemoteMailboxFilters(bool strict)
+    {
+        var ownerUsername = (_ownerUsername ?? string.Empty).Trim().ToLowerInvariant();
+        if (ownerUsername.Length == 0)
+        {
+            return;
+        }
+
+        var fragments = CollectRemoteMailboxSuffixFragments(ownerUsername);
+        if (fragments.Length == 0 && _syncedMailboxSuffixFragments is null)
+        {
+            return;
+        }
+        if (_syncedMailboxSuffixFragments is not null && _syncedMailboxSuffixFragments.SequenceEqual(fragments))
+        {
+            return;
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Put, new Uri(_baseUri, "/v1/token/email/filters"));
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Content = JsonContent.Create(new { suffixes = fragments });
+        using var response = _http.Send(request, _cts.Token);
+        if (!response.IsSuccessStatusCode)
+        {
+            if (!strict)
+            {
+                return;
+            }
+            throw new StreamException($"unexpected mailbox filter sync status code: {(int)response.StatusCode}");
+        }
+
+        _ = response.Content.ReadAsStringAsync(_cts.Token).GetAwaiter().GetResult();
+        _syncedMailboxSuffixFragments = fragments;
+    }
+
+    private string[] CollectRemoteMailboxSuffixFragments(string ownerUsername)
+    {
+        var fragments = new HashSet<string>(StringComparer.Ordinal);
+        var canonicalPrefix = $"{ownerUsername}-mail";
+        lock (_lock)
+        {
+            foreach (var suffix in _bindings.Keys)
+            {
+                var normalizedSuffix = suffix.Trim().ToLowerInvariant();
+                var rootSuffix = $".{Suffix.LinuxDoSpace}";
+                if (!normalizedSuffix.EndsWith(rootSuffix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var label = normalizedSuffix[..^rootSuffix.Length];
+                if (label.Contains('.', StringComparison.Ordinal) || !label.StartsWith(canonicalPrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                fragments.Add(label[canonicalPrefix.Length..]);
+            }
+        }
+        return fragments.OrderBy(static item => item, StringComparer.Ordinal).ToArray();
     }
 
     private void CloseActiveStream()
