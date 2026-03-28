@@ -303,7 +303,7 @@ public sealed class Client : IAsyncDisposable
                 list.RemoveAll(v => ReferenceEquals(v, bindingRef));
                 if (list.Count == 0) _bindings.Remove(normalizedSuffix);
             }
-            _ = TrySyncRemoteMailboxFilters(strict: false);
+            TrySyncRemoteMailboxFilters(strict: false);
         });
         bindingRef = new Binding { Mode = mode, Suffix = normalizedSuffix, AllowOverlap = allowOverlap, Prefix = normalizedPrefix, Regex = regex, MailBox = mailbox };
 
